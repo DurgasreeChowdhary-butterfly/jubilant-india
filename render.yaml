@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: jubilant-india-api
+    env: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: ADZUNA_APP_ID
+        value: f8c82fd7
+      - key: ADZUNA_APP_KEY
+        value: 32db143867e16ca9ad8f57ebd23faee8
+      - key: PLAYWRIGHT_ENABLED
+        value: "false"
+      - key: DB_PATH
+        value: /data/jobs.db
+    disk:
+      name: jubilant-db
+      mountPath: /data
+      sizeGB: 1
