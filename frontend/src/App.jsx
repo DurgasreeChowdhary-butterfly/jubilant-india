@@ -4,7 +4,7 @@ import JobCard    from "./components/JobCard";
 import SearchBar  from "./components/SearchBar";
 import StatsBar   from "./components/StatsBar";
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL || "https://jubilant-india-api.onrender.com";
 const PER_PAGE = 20;
 
 const EMPTY = {
