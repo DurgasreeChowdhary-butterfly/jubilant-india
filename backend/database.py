@@ -19,14 +19,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Session
 
-# DB_PATH env var lets Railway/Docker mount a persistent volume at e.g. /data
-_DB_FILE = os.getenv(
-    "DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "jubilant_india.db"),
-)
-
-# SQLAlchemy engine (for ORM — save_job, init_db)
-DATABASE_URL = f"sqlite:///{_DB_FILE}"
+# DB_PATH env var — set to /data/jobs.db on Render (persistent disk)
+DB_PATH      = os.getenv("DB_PATH", "jobs.db")
+_DB_FILE     = DB_PATH
+DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 
 def _raw_conn() -> sqlite3.Connection:
