@@ -315,7 +315,7 @@ async def scrape_cutshort() -> List[Dict]:
             raw = await _try_html(client)
 
     jobs = [_enrich(r) for r in raw]
-    seen: set[str] = set()
+    seen = set()
     unique: List[Dict] = []
     for j in jobs:
         if j["source_url"] and j["source_url"] not in seen:

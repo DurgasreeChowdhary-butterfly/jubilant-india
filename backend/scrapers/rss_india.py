@@ -250,7 +250,7 @@ async def scrape_rss_india() -> List[Dict]:
             return_exceptions=True,
         )
 
-    seen:   set[str]   = set()
+    seen = set()
     unique: List[Dict] = []
     for batch in results:
         if isinstance(batch, Exception):

@@ -242,7 +242,7 @@ async def scrape_hasjob() -> List[Dict]:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Flatten and deduplicate by relative URL path
-    seen: set[str] = set()
+    seen = set()
     raw_posts: List[Dict] = []
     for batch in results:
         if isinstance(batch, Exception):

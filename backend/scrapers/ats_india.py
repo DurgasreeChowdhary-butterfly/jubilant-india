@@ -487,7 +487,7 @@ async def scrape_ats_all() -> List[Dict]:
             combined.extend(batch)
 
     # Deduplicate by source_url
-    seen:   set[str]   = set()
+    seen = set()
     unique: List[Dict] = []
     for j in combined:
         url = j.get("source_url", "")

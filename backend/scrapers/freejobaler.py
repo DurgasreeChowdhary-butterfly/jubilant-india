@@ -226,7 +226,7 @@ async def scrape_freejobaler() -> List[Dict]:
                 await polite_delay(1.5, 3.0)
 
     jobs = [_enrich(r) for r in all_raw]
-    seen: set[str] = set()
+    seen = set()
     unique: List[Dict] = []
     for j in jobs:
         if j["source_url"] and j["source_url"] not in seen:

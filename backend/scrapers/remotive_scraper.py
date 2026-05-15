@@ -174,7 +174,7 @@ async def scrape_remotive() -> List[Dict]:
             return_exceptions=True,
         )
 
-    seen:   set[str]   = set()
+    seen = set()
     unique: List[Dict] = []
     for batch in results:
         if isinstance(batch, Exception):

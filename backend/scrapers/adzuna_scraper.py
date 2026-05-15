@@ -175,7 +175,7 @@ async def scrape_adzuna() -> List[Dict]:
         print("[Adzuna] WARNING: ADZUNA_APP_ID / ADZUNA_APP_KEY not set — skipping.")
         return []
 
-    seen:     set[str]   = set()
+    seen = set()
     all_jobs: List[Dict] = []
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
