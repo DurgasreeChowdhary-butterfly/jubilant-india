@@ -1,25 +1,19 @@
 """
 wellfound.py — Scraper for wellfound.com (formerly AngelList Talent)
 
-Strategy:
-  1. Fetch /company/{slug}/jobs for each Indian startup
-  2. Extract jobs from __NEXT_DATA__ JSON (Next.js SSR)
-  3. Fall back to BeautifulSoup selectors if JSON yields nothing
-  4. Cloudflare may block — set WELLFOUND_COOKIES env var to bypass
-
-Set WELLFOUND_COOKIES to the raw Cookie header string from a logged-in
-browser session to bypass Cloudflare protection.
+Uses Wellfound's internal GraphQL API with session cookies.
+Falls back to REST search endpoint if GraphQL returns nothing.
+Requires WELLFOUND_COOKIES env var — returns [] gracefully if not set.
 """
 
+import asyncio
 import html
-import json
 import os
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import httpx
-from bs4 import BeautifulSoup
 
 from scrapers.utils import (
     extract_tags,
@@ -27,36 +21,50 @@ from scrapers.utils import (
     normalize_city,
     normalize_experience,
     parse_indian_salary,
-    polite_delay,
 )
 
-BASE_URL = "https://wellfound.com"
+GRAPHQL_URL = "https://wellfound.com/graphql"
+REST_URL    = "https://wellfound.com/api/talent/search/job_listings"
 
-# Top Indian startups with Wellfound profiles.
-# Slugs are best-effort; 404s are skipped gracefully.
-COMPANY_SLUGS = [
-    "meesho", "razorpay", "groww", "zepto", "cred-3",
-    "coinswitch-kuber", "slice-2", "jupiter-money", "fi-money", "smallcase",
-    "urban-company", "unacademy", "physics-wallah", "scaler-3",
-    "dunzo", "rapido", "mfine", "pristyn-care", "licious",
-    "freshworks", "chargebee", "postman", "browserstack", "darwinbox",
-    "leadsquared", "innovaccer", "cleartax-india", "hasura", "setu",
+SEARCHES = [
+    "machine learning",
+    "data scientist",
+    "ai engineer",
+    "python developer",
+    "full stack",
+    "backend engineer",
+    "react developer",
+    "devops",
 ]
 
+GRAPHQL_QUERY = """
+query JobSearchResults($query: String!, $locationId: Int) {
+  talent {
+    jobListings(query: $query, locationId: $locationId) {
+      jobListings {
+        id
+        title
+        slug
+        description
+        remote
+        locationNames
+        compensation
+        jobType
+        createdAt
+        startupRole {
+          startup {
+            name
+            websiteUrl
+          }
+        }
+      }
+    }
+  }
+}
+"""
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
 
-def _build_headers() -> Dict:
-    h = get_random_headers()
-    h["Accept-Encoding"] = "gzip, deflate"
-    h["Accept"] = "text/html,application/xhtml+xml,*/*"
-    cookies_str = os.getenv("WELLFOUND_COOKIES", "").strip()
-    if cookies_str:
-        h["Cookie"] = cookies_str
-    return h
-
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _strip(raw: str) -> str:
     text = re.sub(r"<[^>]+>", " ", raw or "")
@@ -68,190 +76,154 @@ def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def _walk_for_jobs(obj, company_name: str, found: List[Dict], depth: int = 0) -> None:
-    """Recursively walk __NEXT_DATA__ looking for job-like objects."""
-    if depth > 12:
-        return
-    if isinstance(obj, list):
-        for item in obj:
-            _walk_for_jobs(item, company_name, found, depth + 1)
-    elif isinstance(obj, dict):
-        title = obj.get("title") or obj.get("role") or obj.get("jobTitle") or ""
-        if isinstance(title, str) and 3 < len(title) < 120:
-            loc_raw = obj.get("locationNames") or obj.get("location") or ""
-            if obj.get("remote") or obj.get("remote_ok"):
-                loc_raw = loc_raw or "Remote"
-            if isinstance(loc_raw, list):
-                loc_raw = ", ".join(str(x) for x in loc_raw)
-            elif not isinstance(loc_raw, str):
-                loc_raw = ""
-
-            job_id   = obj.get("id") or obj.get("slug") or ""
-            slug_val = obj.get("slug") or str(job_id)
-            apply_link = f"{BASE_URL}/jobs/{slug_val}" if slug_val else BASE_URL
-
-            found.append({
-                "title":       title,
-                "company":     company_name,
-                "location":    loc_raw,
-                "description": str(obj.get("description") or "")[:400],
-                "source_url":  apply_link,
-                "apply_link":  apply_link,
-                "date_posted": _today(),
-            })
-        else:
-            for v in obj.values():
-                _walk_for_jobs(v, company_name, found, depth + 1)
+def _parse_date(value: str) -> str:
+    if not value:
+        return _today()
+    try:
+        return value[:10]
+    except Exception:
+        return _today()
 
 
-def _parse_page(html_text: str, company_name: str) -> List[Dict]:
-    """
-    Two-pass parse: __NEXT_DATA__ JSON first, BeautifulSoup selectors second.
-    """
-    soup = BeautifulSoup(html_text, "html.parser")
-
-    # Pass 1 — __NEXT_DATA__
-    script = soup.find("script", {"id": "__NEXT_DATA__"})
-    if script and script.string:
-        try:
-            data = json.loads(script.string)
-            jobs: List[Dict] = []
-            _walk_for_jobs(data, company_name, jobs)
-            if jobs:
-                return jobs
-        except Exception:
-            pass
-
-    # Pass 2 — CSS selectors (class names change per deploy, try multiple)
-    jobs = []
-    selector_chains = [
-        "li[data-test='startup-job']",
-        "[data-testid='job-listing']",
-        "div[class*='JobListing']",
-        "div[class*='job-listing']",
-        "li[class*='job']",
-    ]
-    for sel in selector_chains:
-        rows = soup.select(sel)
-        if not rows:
-            continue
-        for row in rows:
-            a       = row.select_one("a[href]")
-            t_el    = row.select_one("h3, h4, [class*='title']")
-            loc_el  = row.select_one("[class*='location'], [class*='city']")
-            title   = _strip(str(t_el)) if t_el else (_strip(a.get_text()) if a else "")
-            if not title:
-                continue
-            href = a.get("href", "") if a else ""
-            apply_link = href if href.startswith("http") else f"{BASE_URL}{href}"
-            jobs.append({
-                "title":       title,
-                "company":     company_name,
-                "location":    _strip(str(loc_el)) if loc_el else "",
-                "description": "",
-                "source_url":  apply_link,
-                "apply_link":  apply_link,
-                "date_posted": _today(),
-            })
-        if jobs:
-            break
-
-    return jobs
+def _headers(cookies: str, json_mode: bool = False) -> Dict:
+    h = get_random_headers()
+    h["Accept-Encoding"] = "gzip, deflate"
+    h["Cookie"]          = cookies
+    h["Accept"]          = "application/json" if json_mode else "text/html,*/*"
+    if json_mode:
+        h["Content-Type"] = "application/json"
+    return h
 
 
-def _infer_job_type(title: str, desc: str) -> str:
-    t = f"{title} {desc}".lower()
-    if "intern"   in t: return "Internship"
-    if "contract" in t or "freelance" in t: return "Contract"
-    if "remote"   in t or "work from home" in t: return "Remote"
-    return "Full Time"
+def _map_listing(node: Dict) -> Optional[Dict]:
+    job_id = str(node.get("id") or node.get("slug") or "")
+    if not job_id:
+        return None
+    title = (node.get("title") or "").strip()
+    if not title:
+        return None
 
+    startup = (node.get("startupRole") or {}).get("startup") or {}
+    company = (startup.get("name") or "").strip() or "Unknown"
 
-def _enrich(raw: Dict) -> Dict:
-    title    = raw.get("title", "")
-    location = raw.get("location", "")
-    desc     = raw.get("description", "")
+    remote = node.get("remote", False)
+    locs   = node.get("locationNames") or []
+    location = ", ".join(locs) if locs else ("Remote" if remote else "India")
+
+    desc     = _strip(node.get("description") or "")[:200]
+    comp_str = node.get("compensation") or ""
+    sal_min, sal_max, _ = parse_indian_salary(comp_str)
     combined = f"{title} {location} {desc}"
 
-    m = re.search(
-        r"(?:Rs\.?|INR|₹|\$)?\s*[\d,]+(?:\.\d+)?(?:\s*[-–]\s*[\d,]+(?:\.\d+)?)?"
-        r"(?:\s*(?:LPA|lakh[s]?|per\s*(?:month|year)|/\s*(?:mo|yr)))?",
-        desc, re.I,
-    )
-    salary_raw_str      = m.group(0).strip() if m else ""
-    sal_min, sal_max, _ = parse_indian_salary(salary_raw_str or desc)
+    job_type = "Remote" if remote else (node.get("jobType") or "Full Time")
 
     return {
         "title":               title,
-        "company":             raw.get("company", ""),
+        "company":             company,
         "location":            location,
-        "city":                normalize_city(combined),
-        "salary_raw":          salary_raw_str,
+        "city":                "Remote" if remote else normalize_city(combined),
+        "salary_raw":          comp_str,
         "salary_min":          sal_min,
         "salary_max":          sal_max,
-        "job_type":            _infer_job_type(title, desc),
+        "job_type":            job_type,
         "experience_level":    normalize_experience(combined),
-        "description_snippet": desc[:200],
+        "description_snippet": desc,
         "source":              "Wellfound",
-        "source_url":          raw.get("source_url", ""),
-        "apply_link":          raw.get("apply_link", ""),
+        "source_url":          f"wellfound_{job_id}",
+        "apply_link":          f"https://wellfound.com/jobs/{job_id}",
         "tags":                extract_tags(title, desc),
-        "date_posted":         raw.get("date_posted", _today()),
+        "date_posted":         _parse_date(node.get("createdAt") or ""),
     }
 
 
-# ─────────────────────────────────────────────
-# Public entry point
-# ─────────────────────────────────────────────
+# ── GraphQL path ──────────────────────────────────────────────────────────────
+
+async def _graphql_search(
+    client: httpx.AsyncClient, cookies: str, query: str, location_id: Optional[int] = None
+) -> List[Dict]:
+    payload = {
+        "query":     GRAPHQL_QUERY,
+        "variables": {"query": query, "locationId": location_id},
+    }
+    try:
+        resp = await client.post(GRAPHQL_URL, json=payload, headers=_headers(cookies, json_mode=True), timeout=20)
+        if resp.status_code in (401, 403):
+            return []
+        resp.raise_for_status()
+        data  = resp.json()
+        nodes = (
+            data.get("data", {})
+                .get("talent", {})
+                .get("jobListings", {})
+                .get("jobListings", [])
+        )
+        jobs = [_map_listing(n) for n in (nodes or [])]
+        return [j for j in jobs if j]
+    except Exception as exc:
+        print(f"[Wellfound] GraphQL '{query}': {exc}")
+        return []
+
+
+# ── REST fallback ─────────────────────────────────────────────────────────────
+
+async def _rest_search(client: httpx.AsyncClient, cookies: str, query: str) -> List[Dict]:
+    try:
+        resp = await client.get(
+            REST_URL,
+            params={"query": query},
+            headers=_headers(cookies, json_mode=True),
+            timeout=20,
+        )
+        if resp.status_code not in (200,):
+            return []
+        items = resp.json()
+        if isinstance(items, dict):
+            items = items.get("jobListings") or items.get("results") or []
+        return [j for j in (_map_listing(n) for n in items) if j]
+    except Exception as exc:
+        print(f"[Wellfound] REST '{query}': {exc}")
+        return []
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
 
 async def scrape_wellfound() -> List[Dict]:
     """
-    Scrape Wellfound company job pages for major Indian startups.
-    Returns job dicts ready for database.save_job().
-
-    Set WELLFOUND_COOKIES env var to bypass Cloudflare protection.
+    Scrape Wellfound via GraphQL (then REST fallback) using session cookies.
+    Requires WELLFOUND_COOKIES env var — returns [] if not set.
     """
-    all_raw: List[Dict] = []
-    cf_blocked = False
+    cookies = os.getenv("WELLFOUND_COOKIES", "").strip()
+    if not cookies:
+        print("[Wellfound] WELLFOUND_COOKIES not set — skipping.")
+        return []
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
-        for i, slug in enumerate(COMPANY_SLUGS):
-            if cf_blocked:
-                break
-            try:
-                resp = await client.get(
-                    f"{BASE_URL}/company/{slug}/jobs",
-                    headers=_build_headers(),
-                )
-                if resp.status_code == 404:
-                    continue
-                if resp.status_code in (401, 403):
-                    print(f"[Wellfound] Cloudflare blocked ({resp.status_code}). "
-                          "Set WELLFOUND_COOKIES to bypass.")
-                    cf_blocked = True
-                    continue
-                if resp.status_code != 200:
-                    continue
-
-                company_name = slug.replace("-", " ").title()
-                raw = _parse_page(resp.text, company_name)
-                if raw:
-                    print(f"[Wellfound] {slug}: {len(raw)} jobs")
-                    all_raw.extend(raw)
-
-            except Exception as exc:
-                print(f"[Wellfound] {slug}: {exc}")
-
-            if i < len(COMPANY_SLUGS) - 1:
-                await polite_delay(1.5, 3.0)
-
-    jobs = [_enrich(r) for r in all_raw]
     seen = set()
-    unique: List[Dict] = []
-    for j in jobs:
-        if j["source_url"] and j["source_url"] not in seen:
-            seen.add(j["source_url"])
-            unique.append(j)
+    all_jobs: List[Dict] = []
 
-    print(f"[Wellfound] Total unique jobs: {len(unique)}")
-    return unique
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
+        for query in SEARCHES:
+            # Try GraphQL with Bangalore location (1513) then worldwide
+            batch: List[Dict] = []
+            for loc_id in (1513, None):
+                results = await _graphql_search(client, cookies, query, loc_id)
+                batch.extend(results)
+                await asyncio.sleep(1.0)
+
+            # Fall back to REST if GraphQL returned nothing
+            if not batch:
+                batch = await _rest_search(client, cookies, query)
+                await asyncio.sleep(1.0)
+
+            added = 0
+            for job in batch:
+                key = job["source_url"]
+                if key not in seen:
+                    seen.add(key)
+                    all_jobs.append(job)
+                    added += 1
+
+            print(f"[Wellfound] '{query}': {added} jobs")
+            await asyncio.sleep(1.0)
+
+    print(f"[Wellfound] Total unique jobs: {len(all_jobs)}")
+    return all_jobs
