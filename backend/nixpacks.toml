@@ -1,0 +1,12 @@
+# nixpacks.toml — Railway build config
+# Playwright is disabled in production (set PLAYWRIGHT_ENABLED=false in Railway env)
+# so we skip the heavy Chromium browser download.
+
+[phases.setup]
+nixPkgs = ["python312"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
